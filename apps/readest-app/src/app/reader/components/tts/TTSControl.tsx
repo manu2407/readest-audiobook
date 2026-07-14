@@ -128,6 +128,11 @@ const TTSControl: React.FC<TTSControlProps> = ({ bookKey, gridInsets }) => {
           onSelectTimeout={tts.handleSelectTimeout}
           onSeek={tts.handleSeekTo}
           onGetPlaybackInfo={tts.handleGetPlaybackInfo}
+          isPreprocessed={tts.isPreprocessed}
+          isPreprocessing={tts.isPreprocessing}
+          preprocessingProgress={tts.preprocessingProgress}
+          onPreprocessChapter={tts.handlePreprocessChapter}
+          onDeletePreprocessed={tts.handleDeletePreprocessed}
         />
       )}
     </>

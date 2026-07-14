@@ -4,6 +4,7 @@ import { useAuth } from '@/context/AuthContext';
 import { useThemeStore } from '@/store/themeStore';
 import { useBookDataStore } from '@/store/bookDataStore';
 import { useReaderStore } from '@/store/readerStore';
+import { useSettingsStore } from '@/store/settingsStore';
 import { useBookProgress } from '@/store/readerProgressStore';
 import { useProofreadStore } from '@/store/proofreadStore';
 import { TransformContext } from '@/services/transformers/types';
@@ -25,6 +26,9 @@ import { getLocale } from '@/utils/misc';
 import { estimateTTSTime } from '@/utils/ttsTime';
 import { releaseUnblockAudio, ttsMediaBridge, unblockAudio } from '@/services/tts/ttsMediaBridge';
 import { getBookHashFromKey, ttsSessionManager } from '@/services/tts/TTSSessionManager';
+import { TTSUtils } from '@/services/tts/TTSUtils';
+import { escapeNarrationForSSML } from '@/services/tts/aiScript';
+import { createRejectFilter } from '@/utils/node';
 
 interface UseTTSControlProps {
   bookKey: string;
@@ -53,10 +57,17 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   const [timeoutOption, setTimeoutOption] = useState(0);
   const [timeoutTimestamp, setTimeoutTimestamp] = useState(0);
 
+  const [isPreprocessed, setIsPreprocessed] = useState(false);
+  const [isPreprocessing, setIsPreprocessing] = useState(false);
+  const [preprocessingProgress, setPreprocessingProgress] = useState<number | null>(null);
+
   const followingTTSLocationRef = useRef(true);
   const sectionChangingTimestampRef = useRef(0);
   const previousSectionLabelRef = useRef<string | undefined>(undefined);
   const ttsControllerRef = useRef<TTSController | null>(null);
+  const ttsAiCacheRef = useRef<Map<string, string>>(new Map());
+  const ttsAiFullScriptRef = useRef<string | null>(null);
+  const ttsAiSectionIndexRef = useRef<number>(-1);
   const isStartingTTSRef = useRef(false);
   // Last broadcast playback state, so a follower engaging mid-session can be
   // replayed the current state on demand (see handleTTSSyncRequest).
@@ -513,6 +524,30 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     }
   }, [showBackToCurrentTTSLocation]);
 
+  const checkPreprocessedStatus = useCallback(async () => {
+    const book = getBookData(bookKey)?.book;
+    const sectionIndex = progress?.index ?? 0;
+    if (!book || !appService) {
+      setIsPreprocessed(false);
+      return;
+    }
+    const preprocessedPath = `${book.hash}/ai-chapters/${sectionIndex}.txt`;
+    try {
+      const exists = await appService.exists(preprocessedPath, 'Books');
+      // Also check old .json format for backward compat
+      const oldExists =
+        !exists &&
+        (await appService.exists(`${book.hash}/ai-chapters/${sectionIndex}.json`, 'Books'));
+      setIsPreprocessed(exists || oldExists);
+    } catch {
+      setIsPreprocessed(false);
+    }
+  }, [bookKey, progress?.index, getBookData, appService]);
+
+  useEffect(() => {
+    checkPreprocessedStatus();
+  }, [checkPreprocessedStatus]);
+
   // Location tracking — handleBackToCurrentTTSLocation
   const handleBackToCurrentTTSLocation = () => {
     const view = getView(bookKey);
@@ -577,17 +612,94 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
         (rule) =>
           rule.enabled && rule.onlyForTTS && (rule.scope === 'book' || rule.scope === 'library'),
       );
-      if (ttsOnlyRules.length === 0) return ssml;
 
-      transformCtx['content'] = ssml;
-      transformCtx['viewSettings'] = viewSettings;
-      ssml = await proofreadTransformer.transform(transformCtx, {
-        docType: 'text/xml',
-        onlyForTTS: true,
-      });
-      return ssml;
+      let processedSSML = ssml;
+      if (ttsOnlyRules.length > 0) {
+        transformCtx['content'] = ssml;
+        transformCtx['viewSettings'] = viewSettings;
+        processedSSML = await proofreadTransformer.transform(transformCtx, {
+          docType: 'text/xml',
+          onlyForTTS: true,
+        });
+      }
+
+      if (viewSettings.ttsAiScriptEnabled || appService) {
+        // Check for pre-processed AI chapter script or on-the-fly AI Audiobook Script
+        try {
+          const { parseSSMLMarks, parseSSMLLang } = await import('@/utils/ssml');
+          const { marks } = parseSSMLMarks(processedSSML);
+          if (marks.length > 0) {
+            const controller = ttsControllerRef.current;
+            const sectionIndex = controller?.ttsSectionIndex ?? -1;
+            const book = getBookData(bookKey)?.book;
+
+            // 1. If section changed, try loading a pre-saved full script.
+            if (sectionIndex !== ttsAiSectionIndexRef.current) {
+              ttsAiCacheRef.current.clear();
+              ttsAiFullScriptRef.current = null;
+              ttsAiSectionIndexRef.current = sectionIndex;
+
+              if (book && appService) {
+                const preprocessedPath = `${book.hash}/ai-chapters/${sectionIndex}.txt`;
+                if (await appService.exists(preprocessedPath, 'Books')) {
+                  try {
+                    const content = await appService.readFile(preprocessedPath, 'Books', 'text');
+                    ttsAiFullScriptRef.current = content as string;
+                    console.log(
+                      `[useTTSControl] Loaded full AI audiobook script for section ${sectionIndex} (${(content as string).length} chars).`,
+                    );
+                  } catch (e) {
+                    console.error('[useTTSControl] Failed to load preprocessed AI script:', e);
+                  }
+                }
+              }
+            }
+
+            // 2. If a full preprocessed audiobook script exists, chunk it by ~400 words
+            //    so Kokoro processes each chunk fast. The ~20-40ms gap between chunks
+            //    from mark-to-mark advancement is imperceptible.
+            //    Split at sentence boundaries so each chunk starts clean.
+            if (ttsAiFullScriptRef.current) {
+              const lang = parseSSMLLang(processedSSML) || 'en';
+              const fullScript = ttsAiFullScriptRef.current;
+              const sentenceEnd = /(?<=[.!?])\s+/g;
+              const sentences = fullScript.split(sentenceEnd).filter(Boolean);
+              if (sentences.length > 0) {
+                const CHUNK_WORDS = 400;
+                const chunks: string[] = [];
+                let current: string[] = [];
+                let currentWords = 0;
+                for (const s of sentences) {
+                  const sw = s.split(/\s+/).filter(Boolean).length;
+                  if (currentWords + sw > CHUNK_WORDS && current.length > 0) {
+                    chunks.push(current.join(' '));
+                    current = [s];
+                    currentWords = sw;
+                  } else {
+                    current.push(s);
+                    currentWords += sw;
+                  }
+                }
+                if (current.length > 0) chunks.push(current.join(' '));
+                let body = '';
+                for (let ci = 0; ci < chunks.length; ci++) {
+                  body += `<mark name="chunk-${ci}"/>${escapeNarrationForSSML(chunks[ci]!)} `;
+                }
+                processedSSML = `<speak xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="${lang}">${body}</speak>`;
+                console.log(
+                  `[useTTSControl] Using full preprocessed script: ${chunks.length} chunks (~${CHUNK_WORDS} words each)`,
+                );
+              }
+            }
+          }
+        } catch (err) {
+          console.warn('[useTTSControl] AI script transformation failed, falling back:', err);
+        }
+      }
+
+      return processedSSML;
     },
-    [bookKey, getMergedRules, getViewSettings, transformCtx],
+    [appService, bookKey, getMergedRules, getViewSettings, transformCtx],
   );
 
   // Section change callback
@@ -681,11 +793,28 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   // handleTTSSpeak / handleTTSStop (plain functions, registered once at mount via closure)
   const handleTTSSpeak = async (event: CustomEvent) => {
     const { bookKey: ttsBookKey, range, index, oneTime = false } = event.detail;
-    if (bookKey !== ttsBookKey) return;
+    console.log(
+      '[useTTSControl] handleTTSSpeak triggered for active book:',
+      bookKey,
+      'event details:',
+      { ttsBookKey, oneTime, index },
+    );
+    if (bookKey !== ttsBookKey) {
+      console.log(
+        '[useTTSControl] handleTTSSpeak ignored: active bookKey',
+        bookKey,
+        'does not match target',
+        ttsBookKey,
+      );
+      return;
+    }
     // Guard against concurrent starts (e.g. rapid double-clicks on the TTS
     // icon). Without this, both invocations race past the `await`s below and
     // end up creating two TTSController instances that speak simultaneously.
-    if (isStartingTTSRef.current) return;
+    if (isStartingTTSRef.current) {
+      console.log('[useTTSControl] handleTTSSpeak ignored: start sequence already in progress');
+      return;
+    }
     isStartingTTSRef.current = true;
 
     try {
@@ -694,7 +823,15 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
       const viewSettings = getViewSettings(bookKey);
       const bookData = getBookData(bookKey);
       const { location } = progress || {};
-      if (!view || !progress || !viewSettings || !bookData || !bookData.book) return;
+      if (!view || !progress || !viewSettings || !bookData || !bookData.book) {
+        console.warn('[useTTSControl] Missing reader dependencies for TTS start:', {
+          view: !!view,
+          progress: !!progress,
+          viewSettings: !!viewSettings,
+          bookData: !!bookData,
+        });
+        return;
+      }
       const ttsSpeakRange = range as Range | null;
       let ttsFromRange = ttsSpeakRange;
       let ttsFromIndex = typeof index === 'number' ? index : null;
@@ -731,6 +868,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
       const primaryLang = bookData.book.primaryLanguage;
 
       if (ttsControllerRef.current) {
+        console.log('[useTTSControl] Stopping existing ttsController session.');
         ttsControllerRef.current.stop();
         ttsControllerRef.current = null;
       }
@@ -751,6 +889,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
         setTtsClientsInitialized(false);
 
         setShowIndicator(true);
+        console.log('[useTTSControl] Creating new TTSController instance.');
         const ttsController = new TTSController(
           appService,
           view,
@@ -769,7 +908,26 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
           getSectionLabel: () => getProgress(bookKey)?.sectionLabel,
         });
 
+        console.log('[useTTSControl] Initializing ttsController...');
         await ttsController.init();
+
+        // Match the initial voice choice from viewSettings or defaults
+        const currentVoice =
+          viewSettings.ttsVoice ||
+          TTSUtils.getPreferredVoice(
+            ttsController.ttsClient?.name ?? 'kokoro',
+            primaryLang || 'en',
+          ) ||
+          '';
+        console.log(
+          '[useTTSControl] Applying initial voice choice:',
+          currentVoice,
+          'lang:',
+          primaryLang,
+        );
+        await ttsController.setVoice(currentVoice, primaryLang || 'en');
+
+        console.log('[useTTSControl] Initializing section:', ttsFromIndex);
         await ttsController.initViewTTS(ttsFromIndex);
         ttsController.updateHighlightOptions(
           getTTSHighlightOptions(viewSettings.ttsHighlightOptions, viewSettings.isEink),
@@ -787,6 +945,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
           emitPlaybackState('playing');
           setTtsLang(lang);
 
+          console.log('[useTTSControl] Calling ttsController.speak() for lang:', lang);
           ttsController.setLang(lang);
           ttsController.setRate(viewSettings.ttsRate);
           ttsController.setSentenceGap(viewSettings.ttsSentenceGap ?? DEFAULT_SENTENCE_GAP_SEC);
@@ -796,12 +955,13 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
         }
         setTtsClientsInitialized(true);
         setTTSEnabled(bookKey, true);
+        console.log('[useTTSControl] TTS start sequence completed successfully.');
       } catch (error) {
         eventDispatcher.dispatch('toast', {
           message: _('TTS not supported for this document'),
           type: 'error',
         });
-        console.error(error);
+        console.error('[useTTSControl] TTS start sequence failed:', error);
       }
     } finally {
       isStartingTTSRef.current = false;
@@ -977,6 +1137,296 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     setTimeoutTimestamp(value > 0 ? Date.now() + value * 1000 : 0);
   };
 
+  const handlePreprocessChapter = async () => {
+    if (isPreprocessing) return;
+
+    const bookData = getBookData(bookKey);
+    const book = bookData?.book;
+    const sectionIndex = progress?.index ?? 0;
+    if (!book || !bookData?.bookDoc) {
+      eventDispatcher.dispatch('toast', { type: 'error', message: _('Book metadata not loaded') });
+      return;
+    }
+
+    const { settings } = useSettingsStore.getState();
+    const aiSettings = settings.aiSettings;
+    if (!aiSettings?.enabled) {
+      eventDispatcher.dispatch('toast', {
+        type: 'warning',
+        message: _('To preprocess, configure an AI provider in the AI Settings Panel.'),
+      });
+      return;
+    }
+
+    setIsPreprocessing(true);
+    setPreprocessingProgress(0);
+
+    try {
+      const section = bookData.bookDoc.sections[sectionIndex];
+      if (!section) {
+        throw new Error('Section not found');
+      }
+
+      // 1. Load section document
+      const doc = await section.createDocument();
+
+      // 2. Extract sentences
+      const { getSentences } = await import('foliate-js/tts.js');
+      const { textWalker } = await import('foliate-js/text-walker.js');
+
+      const filter = createRejectFilter({
+        tags: ['rt', 'canvas', 'br'],
+        classes: [
+          'annotationLayer',
+          'epubtype-footnote',
+          'duokan-footnote-content',
+          'duokan-footnote-item',
+        ],
+        attributeTokens: [
+          {
+            tag: 'aside',
+            attribute: 'epub:type',
+            tokens: ['footnote', 'endnote', 'note', 'rearnote'],
+          },
+        ],
+        contents: [{ tag: 'a', content: /^[\[\(]?[\*\d]+[\)\]]?$/ }],
+      });
+
+      const sentences: string[] = [];
+      for (const entry of getSentences(doc, textWalker, filter, 'sentence')) {
+        const text = entry.range.toString().trim();
+        if (text) {
+          sentences.push(text);
+        }
+      }
+
+      if (sentences.length === 0) {
+        eventDispatcher.dispatch('toast', {
+          type: 'info',
+          message: _('No sentences found in this chapter'),
+        });
+        setIsPreprocessing(false);
+        return;
+      }
+
+      console.log(`[useTTSControl] Full Preprocess: Found ${sentences.length} sentences.`);
+
+      // 3. Join all sentences into a single text block and send to AI.
+      setPreprocessingProgress(50);
+
+      const fullText = sentences.join(' ');
+      const wordCount = fullText.split(/\s+/).filter(Boolean).length;
+      console.log(
+        `[useTTSControl] Sending full chapter text (~${wordCount} words) to AI in one prompt...`,
+      );
+
+      const systemPrompt = `You are an audiobook adaptation engine that converts source prose into a narration-ready script for Kokoro-82M, a small open-weight TTS model (StyleTTS 2 + ISTFTNet, no SSML, no built-in emphasis/pause tags — prosody comes only from punctuation, line breaks, and phrasing).
+
+CORE GOAL
+Produce a professionally prepared audiobook manuscript: natural spoken flow, faithful to the source, clean enough for a small TTS model to perform without mispronunciation or awkward pacing. Not a screenplay. Not fragmented poetry.
+
+FIDELITY RULES
+- Preserve meaning, tone, atmosphere, and word choice as written.
+- Do not summarize, condense, or add content, commentary, or analysis.
+- Only alter text for spoken-flow reasons: splitting a run-on sentence, normalizing a number/date/abbreviation for pronunciation, adding punctuation for rhythm. Never change meaning or omit content.
+- Before returning output, confirm nothing was cut or summarized.
+
+FORMATTING RULES
+1. Default to normal paragraphs. Do not put ordinary narration on separate lines.
+2. Isolate a line only for: dialogue, a shouted reaction, a whispered/shocked thought, a major realization, an important name reveal, a scene-ending reveal, or a strong emotional punch. If in doubt, keep it in the paragraph.
+3. Dialogue normally stands on its own line, with its tag ("he said") kept adjacent — split the tag from the line only when the silence itself is the point.
+4. System/spell messages are always isolated and wrapped exactly as:
+   [SYSTEM]
+   message text exactly as written
+   [/SYSTEM]
+5. Control rhythm with commas, periods, em dashes, semicolons, ellipses — not extra line breaks.
+6. Give genuine scene/mood shifts breathing room (a blank line); otherwise keep flowing.
+7. Never insert stage directions like "(pause)", "(whisper)", "(shout)" — convey tone through phrasing and punctuation only, since Kokoro has no tag to act on them.
+
+PRONUNCIATION NORMALIZATION (Kokoro-specific)
+- Spell out numbers, dates, and units in words ("twenty-three", "the third of March").
+- Expand ambiguous abbreviations ("Dr." → "Doctor" unless context makes the letter-form correct).
+- For proper names or Sanskrit/non-English terms likely to be mispronounced, add an inline IPA hint the first time they appear, using Kokoro's supported syntax: [word](/IPA-here/). Leave it unmarked on repeat occurrences.
+
+EXAMPLE
+Source:
+"Get out," she whispered, though her hands were already shaking. The building groaned, then went silent. Ashadev stepped forward.
+
+Output:
+The building groaned, then went silent.
+
+"Get out," she whispered, though her hands were already shaking.
+
+[Ashadev](/ɑːʃəˈdeɪv/) stepped forward.
+
+OUTPUT FORMAT
+Return only the adapted script. No notes, no headers, no bullet points, no explanation.`;
+
+      let polishedScript = '';
+      // Try the configured AI provider first; fall back to agy CLI tool if it fails.
+      try {
+        const { getAIProvider } = await import('@/services/ai/providers');
+        const provider = getAIProvider(aiSettings);
+        const model = provider.getModel();
+        const { generateText } = await import('ai');
+        const response = await generateText({
+          model,
+          system: systemPrompt,
+          prompt: fullText,
+          abortSignal: AbortSignal.timeout(300000),
+        });
+        polishedScript = response.text.trim();
+      } catch (providerErr) {
+        console.warn('[useTTSControl] AI provider failed, trying agy CLI:', providerErr);
+        try {
+          const agyRes = await fetch('/api/ai/agy', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ system: systemPrompt, prompt: fullText }),
+          });
+          if (!agyRes.ok) throw new Error(`agy API returned ${agyRes.status}`);
+          const agyData = await agyRes.json();
+          polishedScript = (agyData.text ?? '').trim();
+        } catch (agyErr) {
+          console.error('[useTTSControl] agy fallback also failed:', agyErr);
+          throw agyErr;
+        }
+      }
+
+      console.log(
+        `[useTTSControl] AI returned full script (${polishedScript.length} chars). First 200: ${polishedScript.slice(0, 200)}`,
+      );
+
+      // 4. Save full script to file system
+      if (!appService) {
+        throw new Error('App service not available');
+      }
+      const dirPath = `${book.hash}/ai-chapters`;
+      await appService.createDir(dirPath, 'Books', true);
+      const preprocessedPath = `${dirPath}/${sectionIndex}.txt`;
+      await appService.writeFile(preprocessedPath, 'Books', polishedScript);
+
+      // Clean up old .json format if present
+      const oldJsonPath = `${dirPath}/${sectionIndex}.json`;
+      if (await appService.exists(oldJsonPath, 'Books')) {
+        await appService.deleteFile(oldJsonPath, 'Books');
+      }
+
+      // 5. Populate in-memory full script if playing this section
+      const controller = ttsControllerRef.current;
+      const activeSectionIndex = controller?.ttsSectionIndex ?? -1;
+      if (activeSectionIndex === sectionIndex) {
+        ttsAiFullScriptRef.current = polishedScript;
+      }
+
+      setIsPreprocessed(true);
+      eventDispatcher.dispatch('toast', {
+        type: 'success',
+        message: _('Chapter pre-processed successfully!'),
+      });
+    } catch (err) {
+      console.error('[useTTSControl] Pre-processing failed:', err);
+      eventDispatcher.dispatch('toast', {
+        type: 'error',
+        message: _('AI pre-processing failed. Please try again.'),
+      });
+    } finally {
+      setIsPreprocessing(false);
+      setPreprocessingProgress(null);
+    }
+  };
+
+  const handleDeletePreprocessed = async () => {
+    const book = getBookData(bookKey)?.book;
+    const sectionIndex = progress?.index ?? 0;
+    if (!book || !appService) return;
+
+    const preprocessedPath = `${book.hash}/ai-chapters/${sectionIndex}.txt`;
+    try {
+      const hasTxt = await appService.exists(preprocessedPath, 'Books');
+      const oldJsonPath = `${book.hash}/ai-chapters/${sectionIndex}.json`;
+      const hasJson = await appService.exists(oldJsonPath, 'Books');
+
+      if (hasTxt || hasJson) {
+        if (hasTxt) await appService.deleteFile(preprocessedPath, 'Books');
+        if (hasJson) await appService.deleteFile(oldJsonPath, 'Books');
+
+        // Clear in-memory cache if it is active
+        const controller = ttsControllerRef.current;
+        const activeSectionIndex = controller?.ttsSectionIndex ?? -1;
+        if (activeSectionIndex === sectionIndex) {
+          ttsAiCacheRef.current.clear();
+          ttsAiFullScriptRef.current = null;
+        }
+
+        setIsPreprocessed(false);
+        eventDispatcher.dispatch('toast', {
+          type: 'success',
+          message: _('Pre-processed script deleted'),
+        });
+      }
+    } catch (err) {
+      console.error('[useTTSControl] Failed to delete preprocessed script:', err);
+      eventDispatcher.dispatch('toast', {
+        type: 'error',
+        message: _('Failed to delete pre-processed script'),
+      });
+    }
+  };
+  // Listen to external pre-process trigger events (e.g. from Settings panel)
+  useEffect(() => {
+    const onPreprocess = (e: Event) => {
+      const customEvent = e as CustomEvent<{ bookKey?: string }>;
+      if (customEvent.detail?.bookKey === bookKey) {
+        handlePreprocessChapter();
+      }
+    };
+    const onDelete = (e: Event) => {
+      const customEvent = e as CustomEvent<{ bookKey?: string }>;
+      if (customEvent.detail?.bookKey === bookKey) {
+        handleDeletePreprocessed();
+      }
+    };
+    const onRequestStatus = (e: Event) => {
+      const customEvent = e as CustomEvent<{ bookKey?: string }>;
+      if (customEvent.detail?.bookKey === bookKey) {
+        eventDispatcher.dispatch('tts-preprocess-status', {
+          bookKey,
+          isPreprocessed,
+          isPreprocessing,
+          preprocessingProgress,
+        });
+      }
+    };
+
+    eventDispatcher.on('tts-preprocess-chapter', onPreprocess);
+    eventDispatcher.on('tts-delete-preprocess', onDelete);
+    eventDispatcher.on('tts-request-preprocess-status', onRequestStatus);
+
+    return () => {
+      eventDispatcher.off('tts-preprocess-chapter', onPreprocess);
+      eventDispatcher.off('tts-delete-preprocess', onDelete);
+      eventDispatcher.off('tts-request-preprocess-status', onRequestStatus);
+    };
+  }, [
+    bookKey,
+    handlePreprocessChapter,
+    handleDeletePreprocessed,
+    isPreprocessed,
+    isPreprocessing,
+    preprocessingProgress,
+  ]);
+
+  // Dispatch preprocessing status updates whenever they change
+  useEffect(() => {
+    eventDispatcher.dispatch('tts-preprocess-status', {
+      bookKey,
+      isPreprocessed,
+      isPreprocessing,
+      preprocessingProgress,
+    });
+  }, [bookKey, isPreprocessed, isPreprocessing, preprocessingProgress]);
+
   const refreshTtsLang = useCallback(() => {
     const speakingLang = ttsControllerRef.current?.getSpeakingLang();
     if (speakingLang) {
@@ -997,6 +1447,11 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     chapterRemainingSec: ttsTime.chapterRemainingSec,
     bookRemainingSec: ttsTime.bookRemainingSec,
     finishAtTimestamp: ttsTime.finishAtTimestamp,
+    isPreprocessed,
+    isPreprocessing,
+    preprocessingProgress,
+    handlePreprocessChapter,
+    handleDeletePreprocessed,
     handleTogglePlay,
     handleBackward,
     handleForward,

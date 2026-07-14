@@ -95,31 +95,48 @@ export class WebSpeechClient implements TTSClient {
   }
 
   async init() {
+    console.log('[WebSpeechClient] init() starting.');
     if (!this.#synth) {
+      console.log('[WebSpeechClient] window.speechSynthesis not found.');
       this.initialized = false;
       return this.initialized;
     }
-    await new Promise<void>((resolve) => {
-      const populateVoices = () => {
-        this.#voices = this.#synth.getVoices().map((voice) => {
-          const webSpeechVoice = voice as WebSpeechVoice;
-          webSpeechVoice.id = voice.voiceURI || voice.name;
-          return webSpeechVoice;
-        });
-        // console.log('Voices', this.#voices);
-        resolve();
-      };
+    try {
+      await Promise.race([
+        new Promise<void>((resolve) => {
+          const populateVoices = () => {
+            this.#voices = this.#synth.getVoices().map((voice) => {
+              const webSpeechVoice = voice as WebSpeechVoice;
+              webSpeechVoice.id = voice.voiceURI || voice.name;
+              return webSpeechVoice;
+            });
+            console.log('[WebSpeechClient] Voices populated:', this.#voices.length);
+            resolve();
+          };
 
-      if (this.#synth.getVoices().length > 0) {
-        populateVoices();
-      } else if (this.#synth.onvoiceschanged !== undefined) {
-        this.#synth.onvoiceschanged = populateVoices;
-      } else {
-        console.warn('Voiceschanged event not supported.');
-        resolve();
-      }
-    });
-    this.initialized = true;
+          if (this.#synth.getVoices().length > 0) {
+            populateVoices();
+          } else if (this.#synth.onvoiceschanged !== undefined) {
+            console.log('[WebSpeechClient] getVoices() empty, waiting for onvoiceschanged...');
+            this.#synth.onvoiceschanged = populateVoices;
+          } else {
+            console.warn('[WebSpeechClient] getVoices() empty and onvoiceschanged not supported.');
+            resolve();
+          }
+        }),
+        new Promise<void>((resolve) => {
+          setTimeout(() => {
+            console.warn('[WebSpeechClient] init() safety timeout fired.');
+            resolve();
+          }, 1000);
+        }),
+      ]);
+      this.initialized = true;
+    } catch (err) {
+      console.error('[WebSpeechClient] init() failed:', err);
+      this.initialized = false;
+    }
+    console.log('[WebSpeechClient] init() completed. Status:', this.initialized);
     return this.initialized;
   }
 

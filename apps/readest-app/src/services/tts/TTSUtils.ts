@@ -10,14 +10,14 @@ export class TTSUtils {
   }
 
   static setPreferredClient(engine: string): void {
-    if (!engine) return;
+    if (!engine || typeof localStorage === 'undefined') return;
     const preferences = this.getPreferences();
     preferences[this.PREFERRED_CLIENT_KEY] = engine;
     localStorage.setItem(this.LOCAL_STORAGE_KEY, JSON.stringify(preferences));
   }
 
   static setPreferredVoice(engine: string, language: string, voiceId: string): void {
-    if (!engine || !language || !voiceId) return;
+    if (!engine || !language || !voiceId || typeof localStorage === 'undefined') return;
     const preferences = this.getPreferences();
     const lang = this.normalizeLanguage(language);
     preferences[`${engine}-${lang}`] = voiceId;
@@ -36,8 +36,13 @@ export class TTSUtils {
   }
 
   private static getPreferences(): Record<string, string> {
-    const storedPreferences = localStorage.getItem(this.LOCAL_STORAGE_KEY);
-    return storedPreferences ? JSON.parse(storedPreferences) : {};
+    if (typeof localStorage === 'undefined') return {};
+    try {
+      const storedPreferences = localStorage.getItem(this.LOCAL_STORAGE_KEY);
+      return storedPreferences ? (JSON.parse(storedPreferences) as Record<string, string>) : {};
+    } catch {
+      return {};
+    }
   }
 
   // Sorts voices matching the given locale (e.g. 'en-GB') before the rest,

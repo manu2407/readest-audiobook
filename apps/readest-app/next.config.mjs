@@ -110,6 +110,7 @@ const nextConfig = {
         source: '/s/:token',
         destination: '/s?token=:token',
       },
+
     ];
   },
   async headers() {

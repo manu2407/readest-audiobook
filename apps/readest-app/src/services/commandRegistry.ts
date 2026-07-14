@@ -3,8 +3,8 @@ import { SettingsPanelType } from '@/components/settings/SettingsDialog';
 import { RiFontSize, RiDashboardLine, RiTranslate, RiShareLine } from 'react-icons/ri';
 import { VscSymbolColor } from 'react-icons/vsc';
 import { LiaHandPointerSolid } from 'react-icons/lia';
-import { IoAccessibilityOutline } from 'react-icons/io5';
-import { PiRobot, PiSpeakerHigh, PiSun, PiMoon } from 'react-icons/pi';
+import { IoAccessibilityOutline, IoGitMergeOutline } from 'react-icons/io5';
+import { PiMusicNote, PiRobot, PiSpeakerHigh, PiSun, PiMoon } from 'react-icons/pi';
 import { TbSunMoon } from 'react-icons/tb';
 import { MdRefresh } from 'react-icons/md';
 import { IconType } from 'react-icons';
@@ -152,6 +152,8 @@ const panelIcons: Record<SettingsPanelType, IconType> = {
   Theme: VscSymbolColor,
   Control: LiaHandPointerSolid,
   TTS: PiSpeakerHigh,
+  Music: PiMusicNote,
+  VoiceBlend: IoGitMergeOutline,
   Language: RiTranslate,
   AI: PiRobot,
   Integrations: RiShareLine,

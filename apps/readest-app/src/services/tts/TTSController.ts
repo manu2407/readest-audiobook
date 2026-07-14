@@ -13,6 +13,7 @@ import { createRejectFilter } from '@/utils/node';
 import { WebSpeechClient } from './WebSpeechClient';
 import { NativeTTSClient } from './NativeTTSClient';
 import { EdgeTTSClient } from './EdgeTTSClient';
+import { KokoroTTSClient } from './KokoroTTSClient';
 import { SectionTimeline, TimelineSentence } from './SectionTimeline';
 import { TTSUtils } from './TTSUtils';
 import { TTSClient } from './TTSClient';
@@ -160,9 +161,11 @@ export class TTSController extends EventTarget {
   ttsClient: TTSClient;
   ttsWebClient: TTSClient;
   ttsEdgeClient: EdgeTTSClient;
+  ttsKokoroClient: TTSClient;
   ttsNativeClient: TTSClient | null = null;
   ttsWebVoices: TTSVoice[] = [];
   ttsEdgeVoices: TTSVoice[] = [];
+  ttsKokoroVoices: TTSVoice[] = [];
   ttsNativeVoices: TTSVoice[] = [];
   ttsTargetLang: string = '';
 
@@ -178,6 +181,7 @@ export class TTSController extends EventTarget {
     super();
     this.ttsWebClient = new WebSpeechClient(this);
     this.ttsEdgeClient = new EdgeTTSClient(this, appService);
+    this.ttsKokoroClient = new KokoroTTSClient(this);
     // Native TTS is backed by Android TextToSpeech and iOS AVSpeechSynthesizer.
     // TODO: implement native TTS client for desktop platforms.
     if (appService?.isAndroidApp || appService?.isIOSApp) {
@@ -231,6 +235,14 @@ export class TTSController extends EventTarget {
 
   get isViewAttached(): boolean {
     return this.#attached;
+  }
+
+  get ttsDoc(): Document | null {
+    return this.#ttsDoc;
+  }
+
+  get ttsSectionIndex(): number {
+    return this.#ttsSectionIndex;
   }
 
   // Enter headless mode. Audio, the abort signal, and the in-flight speak
@@ -313,29 +325,60 @@ export class TTSController extends EventTarget {
   }
 
   async init() {
+    console.log('[TTSController] init() starting. Checking available clients...');
     const availableClients = [];
-    if (await this.ttsEdgeClient.init()) {
+    // Kokoro comes first: local TTS doesn't need auth, so prefer it over Edge.
+    const isKokoroInit = await this.ttsKokoroClient.init();
+    console.log('[TTSController] Kokoro initialized status:', isKokoroInit);
+    if (isKokoroInit) {
+      availableClients.push(this.ttsKokoroClient);
+    }
+    const isEdgeInit = await this.ttsEdgeClient.init();
+    console.log('[TTSController] Edge initialized status:', isEdgeInit);
+    if (isEdgeInit) {
       availableClients.push(this.ttsEdgeClient);
     }
-    if (this.ttsNativeClient && (await this.ttsNativeClient.init())) {
-      availableClients.push(this.ttsNativeClient);
-      this.ttsNativeVoices = await this.ttsNativeClient.getAllVoices();
+    if (this.ttsNativeClient) {
+      const isNativeInit = await this.ttsNativeClient.init();
+      console.log('[TTSController] Native initialized status:', isNativeInit);
+      if (isNativeInit) {
+        availableClients.push(this.ttsNativeClient);
+        this.ttsNativeVoices = await this.ttsNativeClient.getAllVoices();
+      }
     }
-    if (await this.ttsWebClient.init()) {
+    const isWebInit = await this.ttsWebClient.init();
+    console.log('[TTSController] Web Speech initialized status:', isWebInit);
+    if (isWebInit) {
       availableClients.push(this.ttsWebClient);
     }
+
+    console.log(
+      '[TTSController] Available clients list:',
+      availableClients.map((c) => c.name),
+    );
     this.ttsClient = availableClients[0] || this.ttsWebClient;
     const preferredClientName = TTSUtils.getPreferredClient();
+    console.log('[TTSController] Preferred client from storage:', preferredClientName);
     if (preferredClientName) {
       const preferredClient = availableClients.find(
         (client) => client.name === preferredClientName,
       );
       if (preferredClient) {
         this.ttsClient = preferredClient;
+        console.log('[TTSController] Switched to preferred client:', preferredClient.name);
+      } else {
+        console.log(
+          '[TTSController] Preferred client not available. Fallback to:',
+          this.ttsClient.name,
+        );
       }
+    } else {
+      console.log('[TTSController] No preferred client set. Defaulting to:', this.ttsClient.name);
     }
     this.ttsWebVoices = await this.ttsWebClient.getAllVoices();
     this.ttsEdgeVoices = await this.ttsEdgeClient.getAllVoices();
+    this.ttsKokoroVoices = await this.ttsKokoroClient.getAllVoices();
+    console.log('[TTSController] init() finished. Current client is:', this.ttsClient.name);
   }
 
   #getPrimaryContent() {
@@ -699,6 +742,7 @@ export class TTSController extends EventTarget {
   }
 
   async #speak(ssml: string | undefined | Promise<string>, oneTime = false) {
+    console.log('[TTSController] #speak() called. Terminating current playback first.');
     await this.stop();
     this.#terminated = false;
     this.#currentSpeakAbortController = new AbortController();
@@ -706,22 +750,31 @@ export class TTSController extends EventTarget {
 
     this.#currentSpeakPromise = new Promise(async (resolve, reject) => {
       try {
-        console.log('[TTS] speak');
+        console.log('[TTSController] speak starting with client:', this.ttsClient.name);
         this.state = 'playing';
 
         signal.addEventListener('abort', () => {
+          console.log('[TTSController] speak promise aborted.');
           resolve();
         });
 
-        ssml = await this.#preprocessSSML(await ssml);
+        const rawSsml = await ssml;
+        console.log('[TTSController] speak raw ssml length:', rawSsml?.length);
+        ssml = await this.#preprocessSSML(rawSsml);
         if (!ssml) {
           this.#nossmlCnt++;
+          console.log(
+            '[TTSController] speak preprocess returned empty SSML. Count:',
+            this.#nossmlCnt,
+          );
           // FIXME: in case we are at the end of the book, need a better way to handle this
           if (this.#nossmlCnt < 10 && this.state === 'playing' && !oneTime) {
             resolve();
             if (await this.#initTTSForNextSection()) {
+              console.log('[TTSController] Moving to next section.');
               await this.forward();
             } else {
+              console.log('[TTSController] End of book reached.');
               // End of book: nothing left to speak.
               this.#terminate('ended');
               await this.stop();
@@ -913,6 +966,7 @@ export class TTSController extends EventTarget {
 
   async setPrimaryLang(lang: string) {
     if (this.ttsEdgeClient.initialized) this.ttsEdgeClient.setPrimaryLang(lang);
+    if (this.ttsKokoroClient.initialized) this.ttsKokoroClient.setPrimaryLang(lang);
     if (this.ttsWebClient.initialized) this.ttsWebClient.setPrimaryLang(lang);
     if (this.ttsNativeClient?.initialized) this.ttsNativeClient?.setPrimaryLang(lang);
   }
@@ -927,13 +981,20 @@ export class TTSController extends EventTarget {
   async getVoices(lang: string) {
     const ttsWebVoices = await this.ttsWebClient.getVoices(lang);
     const ttsEdgeVoices = await this.ttsEdgeClient.getVoices(lang);
+    const ttsKokoroVoices = await this.ttsKokoroClient.getVoices(lang);
     const ttsNativeVoices = (await this.ttsNativeClient?.getVoices(lang)) ?? [];
 
-    const voicesGroups = [...ttsNativeVoices, ...ttsEdgeVoices, ...ttsWebVoices];
+    const voicesGroups = [
+      ...ttsNativeVoices,
+      ...ttsKokoroVoices,
+      ...ttsEdgeVoices,
+      ...ttsWebVoices,
+    ];
     return voicesGroups;
   }
 
   async setVoice(voiceId: string, lang: string) {
+    console.log('[TTSController] setVoice called:', { voiceId, lang });
     this.state = 'setvoice-paused';
     const useEdgeTTS = !!this.ttsEdgeVoices.find(
       (voice) => (voiceId === '' || voice.id === voiceId) && !voice.disabled,
@@ -941,19 +1002,46 @@ export class TTSController extends EventTarget {
     const useNativeTTS = !!this.ttsNativeVoices.find(
       (voice) => (voiceId === '' || voice.id === voiceId) && !voice.disabled,
     );
+    const useKokoroTTS = !!this.ttsKokoroVoices.find(
+      (voice) => (voiceId === '' || voice.id === voiceId) && !voice.disabled,
+    );
+    console.log('[TTSController] setVoice search results:', {
+      useEdgeTTS,
+      useNativeTTS,
+      useKokoroTTS,
+    });
     if (useEdgeTTS) {
+      console.log('[TTSController] setVoice resolved to EdgeTTSClient');
       this.ttsClient = this.ttsEdgeClient;
       await this.ttsClient.setRate(this.ttsRate);
+    } else if (useKokoroTTS) {
+      console.log('[TTSController] setVoice resolved to KokoroTTSClient');
+      if (!this.ttsKokoroClient.initialized) {
+        console.log('[TTSController] KokoroTTSClient not yet initialized, initializing now...');
+        await this.ttsKokoroClient.init();
+      }
+      this.ttsClient = this.ttsKokoroClient;
+      if (this.ttsKokoroClient.initialized) {
+        await this.ttsClient.setRate(this.ttsRate);
+      } else {
+        console.warn('[TTSController] KokoroTTSClient initialization failed!');
+      }
     } else if (useNativeTTS) {
+      console.log('[TTSController] setVoice resolved to NativeTTSClient');
       if (!this.ttsNativeClient) {
         throw new Error('Native TTS client is not available');
       }
       this.ttsClient = this.ttsNativeClient;
       await this.ttsClient.setRate(this.ttsRate);
     } else {
+      console.log('[TTSController] setVoice resolved to WebSpeechClient');
       this.ttsClient = this.ttsWebClient;
       await this.ttsClient.setRate(this.ttsRate);
     }
+    console.log(
+      '[TTSController] setVoice saving preferred voice preferences. Client:',
+      this.ttsClient.name,
+    );
     TTSUtils.setPreferredClient(this.ttsClient.name);
     TTSUtils.setPreferredVoice(this.ttsClient.name, lang, voiceId);
     await this.ttsClient.setVoice(voiceId);
@@ -1211,6 +1299,9 @@ export class TTSController extends EventTarget {
     }
     if (this.ttsEdgeClient.initialized) {
       await this.ttsEdgeClient.shutdown();
+    }
+    if (this.ttsKokoroClient.initialized) {
+      await this.ttsKokoroClient.shutdown();
     }
     if (this.ttsNativeClient?.initialized) {
       await this.ttsNativeClient.shutdown();

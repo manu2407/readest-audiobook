@@ -20,6 +20,12 @@ vi.mock('@/services/tts/EdgeTTSClient', () => ({
   }),
 }));
 
+vi.mock('@/services/tts/KokoroTTSClient', () => ({
+  KokoroTTSClient: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
+    Object.assign(this, createMockTTSClient('kokoro-tts'));
+  }),
+}));
+
 vi.mock('@/services/tts/NativeTTSClient', () => ({
   NativeTTSClient: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
     Object.assign(this, createMockTTSClient('native'));
@@ -248,10 +254,9 @@ describe('TTSController', () => {
       expect(controller.ttsWebClient.init).toHaveBeenCalled();
     });
 
-    test('sets ttsClient to first available client (edge)', async () => {
+    test('sets ttsClient to first available client (kokoro)', async () => {
       await controller.init();
-      // edge inits first and succeeds, so it becomes the active client
-      expect(controller.ttsClient.name).toBe('edge');
+      expect(controller.ttsClient.name).toBe('kokoro-tts');
     });
 
     test('fetches voices from web and edge clients', async () => {
@@ -270,8 +275,8 @@ describe('TTSController', () => {
     test('falls back to web client when preferred client not found', async () => {
       vi.mocked(TTSUtils.getPreferredClient).mockReturnValue('nonexistent');
       await controller.init();
-      // first available is edge
-      expect(controller.ttsClient.name).toBe('edge');
+      // first available is Kokoro
+      expect(controller.ttsClient.name).toBe('kokoro-tts');
     });
 
     test('also initializes native client on Android', async () => {

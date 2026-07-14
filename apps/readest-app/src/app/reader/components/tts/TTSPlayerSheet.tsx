@@ -77,6 +77,11 @@ type TTSPlayerSheetProps = {
   onSelectTimeout: (bookKey: string, value: number) => void;
   onSeek: (seconds: number) => Promise<void>;
   onGetPlaybackInfo: () => TTSPlaybackInfo | null;
+  isPreprocessed?: boolean;
+  isPreprocessing?: boolean;
+  preprocessingProgress?: number | null;
+  onPreprocessChapter?: () => void;
+  onDeletePreprocessed?: () => void;
 };
 
 // Full player sheet: cover, chapter, scrubber, transport, and one compact
@@ -105,6 +110,11 @@ const TTSPlayerSheet = ({
   onSelectTimeout,
   onSeek,
   onGetPlaybackInfo,
+  isPreprocessed = false,
+  isPreprocessing = false,
+  preprocessingProgress = null,
+  onPreprocessChapter,
+  onDeletePreprocessed,
 }: TTSPlayerSheetProps) => {
   const _ = useTranslation();
   const { envConfig } = useEnv();
@@ -262,7 +272,8 @@ const TTSPlayerSheet = ({
       snapHeight={0.65}
       title={_('Read Aloud')}
       header={header}
-      boxClassName='sm:!h-auto sm:!max-h-[85%] sm:!w-[420px] sm:!min-w-0'
+      className='sm:!items-start sm:!justify-start'
+      boxClassName='sm:!h-auto sm:!max-h-[85%] sm:!w-[520px] sm:!min-w-0 sm:!ml-4'
       contentClassName='!px-4 sm:!px-4 mt-[-4px]'
       onClose={onClose}
     >
@@ -385,6 +396,48 @@ const TTSPlayerSheet = ({
                 {formatGap(paragraphGap)}
               </span>
             </button>
+          </div>
+          <div className='w-full border-t border-base-content/10 pt-4 flex flex-col gap-2'>
+            <div className='flex items-center justify-between px-1'>
+              <div className='flex flex-col'>
+                <span className='text-xs font-semibold'>{_('AI Audiobook Script')}</span>
+                <span className='text-xs text-base-content/60'>
+                  {isPreprocessing
+                    ? _('Processing... {{progress}}%', { progress: preprocessingProgress ?? 0 })
+                    : isPreprocessed
+                      ? _('Offline script ready')
+                      : _('Improve pronunciations offline')}
+                </span>
+              </div>
+              <div className='flex gap-2'>
+                {isPreprocessed ? (
+                  <button
+                    type='button'
+                    onClick={onDeletePreprocessed}
+                    className='btn btn-xs btn-error btn-outline'
+                  >
+                    {_('Delete')}
+                  </button>
+                ) : (
+                  <button
+                    type='button'
+                    onClick={onPreprocessChapter}
+                    disabled={isPreprocessing}
+                    className={clsx('btn btn-xs btn-primary', isPreprocessing && 'loading')}
+                  >
+                    {isPreprocessing ? _('Processing...') : _('Pre-process')}
+                  </button>
+                )}
+              </div>
+            </div>
+            {isPreprocessing && (
+              <div className='w-full bg-base-200 h-1.5 rounded-full overflow-hidden'>
+                <div
+                  className='bg-primary h-full transition-all duration-300'
+                  style={{ width: `${preprocessingProgress ?? 0}%` }}
+                />
+              </div>
+            )}
           </div>
         </div>
       )}

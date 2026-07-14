@@ -321,6 +321,7 @@ export interface TTSConfig {
   ttsHighlightOptions: TTSHighlightOptions;
   ttsHighlightGranularity: TTSHighlightGranularity;
   ttsMediaMetadata: TTSMediaMetadataMode;
+  ttsAiScriptEnabled?: boolean;
 }
 
 export interface TranslatorConfig {

@@ -8,9 +8,9 @@ import { useCommandPalette } from '@/components/command-palette';
 import { RiFontSize, RiShareLine } from 'react-icons/ri';
 import { RiDashboardLine, RiTranslate } from 'react-icons/ri';
 import { VscSymbolColor } from 'react-icons/vsc';
-import { PiDotsThreeVerticalBold, PiRobot, PiSpeakerHigh } from 'react-icons/pi';
+import { PiDotsThreeVerticalBold, PiMusicNote, PiRobot, PiSpeakerHigh } from 'react-icons/pi';
 import { LiaHandPointerSolid } from 'react-icons/lia';
-import { IoAccessibilityOutline } from 'react-icons/io5';
+import { IoAccessibilityOutline, IoGitMergeOutline } from 'react-icons/io5';
 import {
   MdArrowBackIosNew,
   MdArrowForwardIos,
@@ -33,6 +33,8 @@ import LangPanel from './LangPanel';
 import MiscPanel from './MiscPanel';
 import AIPanel from './AIPanel';
 import TTSPanel from './TTSPanel';
+import MusicSettingsPanel from './MusicSettingsPanel';
+import VoiceBlendPanel from './VoiceBlendPanel';
 
 export type SettingsPanelType =
   | 'Font'
@@ -40,6 +42,8 @@ export type SettingsPanelType =
   | 'Theme'
   | 'Control'
   | 'TTS'
+  | 'Music'
+  | 'VoiceBlend'
   | 'Language'
   | 'AI'
   | 'Integrations'
@@ -123,6 +127,16 @@ const SettingsDialog: React.FC<{ bookKey: string }> = ({ bookKey }) => {
       label: _('TTS'),
     },
     {
+      tab: 'Music',
+      icon: PiMusicNote,
+      label: _('Music'),
+    },
+    {
+      tab: 'VoiceBlend',
+      icon: IoGitMergeOutline,
+      label: _('Voice Blend'),
+    },
+    {
       tab: 'Custom',
       icon: IoAccessibilityOutline,
       label: _('Custom'),
@@ -177,6 +191,8 @@ const SettingsDialog: React.FC<{ bookKey: string }> = ({ bookKey }) => {
     Theme: null,
     Control: null,
     TTS: null,
+    Music: null,
+    VoiceBlend: null,
     Language: null,
     AI: null,
     Integrations: null,
@@ -211,6 +227,8 @@ const SettingsDialog: React.FC<{ bookKey: string }> = ({ bookKey }) => {
         theme: 'Theme',
         control: 'Control',
         tts: 'TTS',
+        music: 'Music',
+        voiceblend: 'VoiceBlend',
         language: 'Language',
         ai: 'AI',
         integrations: 'Integrations',
@@ -474,6 +492,8 @@ const SettingsDialog: React.FC<{ bookKey: string }> = ({ bookKey }) => {
         )}
         {activePanel === 'AI' && <AIPanel />}
         {activePanel === 'Integrations' && <IntegrationsPanel />}
+        {activePanel === 'Music' && <MusicSettingsPanel />}
+        {activePanel === 'VoiceBlend' && <VoiceBlendPanel />}
         {activePanel === 'Custom' && (
           <MiscPanel
             bookKey={bookKey}

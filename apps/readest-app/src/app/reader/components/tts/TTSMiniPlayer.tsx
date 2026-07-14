@@ -89,7 +89,7 @@ const TTSMiniPlayer = ({
       role='status'
       aria-label={`${_('Reading aloud')}: ${book?.title ?? ''}`}
       className={clsx(
-        'absolute bottom-2 z-40 inset-x-2 sm:inset-x-0 sm:mx-auto sm:w-full sm:max-w-md',
+        'absolute bottom-2 z-40 inset-x-2 sm:inset-x-2 sm:mx-0 sm:w-full sm:max-w-lg',
         'transition-opacity duration-300',
         isVisible ? 'pointer-events-auto opacity-100' : 'pointer-events-none opacity-0',
       )}
