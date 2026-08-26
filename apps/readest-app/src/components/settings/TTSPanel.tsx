@@ -12,11 +12,18 @@ import { BoxedList, SettingsRow, SettingsSelect } from './primitives';
 import TTSHighlightStyleEditor, { TTSHighlightStyle } from './color/TTSHighlightStyleEditor';
 import { TTSUtils } from '@/services/tts/TTSUtils';
 import { KOKORO_VOICES } from '@/services/tts/KokoroTTSClient';
+import {
+  VIBEVOICE_VOICES,
+  VIBEVOICE_QUANTIZATIONS,
+  VibeVoiceQuantizationId,
+  VIBEVOICE_MODEL,
+} from '@/services/tts/VibeVoiceTTSClient';
 import { eventDispatcher } from '@/utils/event';
 import { useBookDataStore } from '@/store/bookDataStore';
 
 // Static engine metadata — the TTSController client `name` values.
 const TTS_ENGINES = [
+  { id: 'vibevoice', label: 'VibeVoice Realtime 0.5B (GGUF Local)' },
   { id: 'kokoro', label: 'Kokoro (Local)' },
   { id: 'edge-tts', label: 'Edge TTS' },
   { id: 'web-speech', label: 'Web Speech' },
@@ -74,6 +81,18 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
     viewSettings.ttsAiScriptEnabled ?? false,
   );
   const [kokoroStatus, setKokoroStatus] = useState<'checking' | 'online' | 'offline'>('checking');
+  const [vibevoiceStatus, setVibevoiceStatus] = useState<'checking' | 'online' | 'offline'>(
+    'checking',
+  );
+  const [vibevoiceQuantization, setVibevoiceQuantization] = useState<VibeVoiceQuantizationId>(
+    () => {
+      if (typeof localStorage !== 'undefined') {
+        const saved = localStorage.getItem('vibevoiceQuantization') as VibeVoiceQuantizationId;
+        if (saved && VIBEVOICE_QUANTIZATIONS.some((q) => q.id === saved)) return saved;
+      }
+      return 'q4_k';
+    },
+  );
 
   // — Kokoro health check —
   const checkKokoroHealth = useCallback(async () => {
@@ -89,9 +108,24 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
     }
   }, []);
 
+  // — VibeVoice health check —
+  const checkVibevoiceHealth = useCallback(async () => {
+    setVibevoiceStatus('checking');
+    try {
+      const resp = await fetch('/api/tts/vibevoice', {
+        method: 'OPTIONS',
+        signal: AbortSignal.timeout(5000),
+      });
+      setVibevoiceStatus(resp.ok || resp.status === 204 ? 'online' : 'offline');
+    } catch {
+      setVibevoiceStatus('offline');
+    }
+  }, []);
+
   useEffect(() => {
     checkKokoroHealth();
-  }, [checkKokoroHealth]);
+    checkVibevoiceHealth();
+  }, [checkKokoroHealth, checkVibevoiceHealth]);
 
   // — Reset handler —
   const resetToDefaults = useResetViewSettings();
@@ -243,6 +277,14 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
     TTSUtils.setPreferredVoice(selectedEngine, lang, voiceId);
   };
 
+  const handleQuantizationChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
+    const q = event.target.value as VibeVoiceQuantizationId;
+    setVibevoiceQuantization(q);
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem('vibevoiceQuantization', q);
+    }
+  };
+
   // — Build Kokoro voice groups by language —
   const kokoroVoicesByLang = KOKORO_VOICES.reduce(
     (acc, v) => {
@@ -266,6 +308,64 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
             options={TTS_ENGINES.map((e) => ({ value: e.id, label: e.label }))}
           />
         </SettingsRow>
+
+        {selectedEngine === 'vibevoice' && (
+          <>
+            <SettingsRow
+              label={_('VibeVoice Server')}
+              description={
+                vibevoiceStatus === 'checking'
+                  ? _('Checking...')
+                  : vibevoiceStatus === 'online'
+                    ? _('Connected (cstr/vibevoice-realtime-0.5b-GGUF)')
+                    : _('Not running — start local server on localhost:8880 or localhost:17600')
+              }
+            >
+              <div className='flex items-center gap-2'>
+                <span
+                  className={clsx(
+                    'inline-block h-2.5 w-2.5 rounded-full',
+                    vibevoiceStatus === 'online' && 'bg-emerald-500',
+                    vibevoiceStatus === 'offline' && 'bg-red-400',
+                    vibevoiceStatus === 'checking' && 'bg-amber-400 animate-pulse',
+                  )}
+                />
+                <span className='text-base-content/70 text-sm'>
+                  {vibevoiceStatus === 'online'
+                    ? _('Connected')
+                    : vibevoiceStatus === 'offline'
+                      ? _('Offline')
+                      : _('Checking')}
+                </span>
+                {vibevoiceStatus === 'offline' && (
+                  <button
+                    type='button'
+                    onClick={checkVibevoiceHealth}
+                    className='btn btn-ghost btn-xs'
+                    aria-label={_('Retry')}
+                  >
+                    {_('Retry')}
+                  </button>
+                )}
+              </div>
+            </SettingsRow>
+
+            <SettingsRow
+              label={_('Quantization')}
+              description={_('Choose GGUF precision (Q4_K recommended for fast real-time TTS)')}
+            >
+              <SettingsSelect
+                value={vibevoiceQuantization}
+                onChange={handleQuantizationChange}
+                ariaLabel={_('Quantization')}
+                options={VIBEVOICE_QUANTIZATIONS.map((q) => ({
+                  value: q.id,
+                  label: q.name,
+                }))}
+              />
+            </SettingsRow>
+          </>
+        )}
 
         {selectedEngine === 'kokoro' && (
           <SettingsRow
@@ -354,7 +454,50 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
         </BoxedList>
       )}
 
-      {selectedEngine !== 'kokoro' && (
+      {/* ─── Voice Picker (VibeVoice) ─── */}
+      {selectedEngine === 'vibevoice' && (
+        <BoxedList
+          title={_('VibeVoice Voice')}
+          description={
+            vibevoiceStatus === 'offline'
+              ? _('Start the VibeVoice model server to use these voices.')
+              : `${_('Model:')} ${VIBEVOICE_MODEL}`
+          }
+          data-setting-id='settings.tts.vibevoiceVoice'
+        >
+          <div>
+            <div className='text-base-content/60 px-0 pb-0.5 pt-2.5 text-xs font-semibold uppercase tracking-wide'>
+              {_('English Voices')}
+            </div>
+            {VIBEVOICE_VOICES.map((voice) => (
+              <button
+                key={voice.id}
+                type='button'
+                onClick={() => handleVoiceSelect(voice.id, voice.lang)}
+                className={clsx(
+                  'flex w-full items-center gap-2.5 rounded-lg px-0 py-2 text-start transition-colors',
+                  'hover:bg-base-200/60',
+                  selectedVoice === voice.id && 'bg-base-200/40',
+                )}
+              >
+                <span className='flex h-5 w-5 flex-shrink-0 items-center justify-center'>
+                  {selectedVoice === voice.id && (
+                    <span className='text-primary text-sm font-bold'>✓</span>
+                  )}
+                </span>
+                <span className='text-sm'>
+                  {voice.name}
+                  <span className='text-base-content/50 ml-1.5 text-xs'>
+                    {voice.gender === 'female' ? '♀' : '♂'}
+                  </span>
+                </span>
+              </button>
+            ))}
+          </div>
+        </BoxedList>
+      )}
+
+      {selectedEngine !== 'kokoro' && selectedEngine !== 'vibevoice' && (
         <BoxedList
           title={_('Voice')}
           description={_(

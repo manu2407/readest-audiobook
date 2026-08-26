@@ -14,6 +14,7 @@ import { WebSpeechClient } from './WebSpeechClient';
 import { NativeTTSClient } from './NativeTTSClient';
 import { EdgeTTSClient } from './EdgeTTSClient';
 import { KokoroTTSClient } from './KokoroTTSClient';
+import { VibeVoiceTTSClient } from './VibeVoiceTTSClient';
 import { SectionTimeline, TimelineSentence } from './SectionTimeline';
 import { TTSUtils } from './TTSUtils';
 import { TTSClient } from './TTSClient';
@@ -162,10 +163,12 @@ export class TTSController extends EventTarget {
   ttsWebClient: TTSClient;
   ttsEdgeClient: EdgeTTSClient;
   ttsKokoroClient: TTSClient;
+  ttsVibeVoiceClient: TTSClient;
   ttsNativeClient: TTSClient | null = null;
   ttsWebVoices: TTSVoice[] = [];
   ttsEdgeVoices: TTSVoice[] = [];
   ttsKokoroVoices: TTSVoice[] = [];
+  ttsVibeVoiceVoices: TTSVoice[] = [];
   ttsNativeVoices: TTSVoice[] = [];
   ttsTargetLang: string = '';
 
@@ -182,6 +185,7 @@ export class TTSController extends EventTarget {
     this.ttsWebClient = new WebSpeechClient(this);
     this.ttsEdgeClient = new EdgeTTSClient(this, appService);
     this.ttsKokoroClient = new KokoroTTSClient(this);
+    this.ttsVibeVoiceClient = new VibeVoiceTTSClient(this);
     // Native TTS is backed by Android TextToSpeech and iOS AVSpeechSynthesizer.
     // TODO: implement native TTS client for desktop platforms.
     if (appService?.isAndroidApp || appService?.isIOSApp) {
@@ -327,7 +331,12 @@ export class TTSController extends EventTarget {
   async init() {
     console.log('[TTSController] init() starting. Checking available clients...');
     const availableClients = [];
-    // Kokoro comes first: local TTS doesn't need auth, so prefer it over Edge.
+    // Local TTS clients don't need cloud auth, so prefer them over Edge.
+    const isVibeVoiceInit = await this.ttsVibeVoiceClient.init();
+    console.log('[TTSController] VibeVoice initialized status:', isVibeVoiceInit);
+    if (isVibeVoiceInit) {
+      availableClients.push(this.ttsVibeVoiceClient);
+    }
     const isKokoroInit = await this.ttsKokoroClient.init();
     console.log('[TTSController] Kokoro initialized status:', isKokoroInit);
     if (isKokoroInit) {
@@ -378,6 +387,7 @@ export class TTSController extends EventTarget {
     this.ttsWebVoices = await this.ttsWebClient.getAllVoices();
     this.ttsEdgeVoices = await this.ttsEdgeClient.getAllVoices();
     this.ttsKokoroVoices = await this.ttsKokoroClient.getAllVoices();
+    this.ttsVibeVoiceVoices = await this.ttsVibeVoiceClient.getAllVoices();
     console.log('[TTSController] init() finished. Current client is:', this.ttsClient.name);
   }
 
@@ -967,6 +977,7 @@ export class TTSController extends EventTarget {
   async setPrimaryLang(lang: string) {
     if (this.ttsEdgeClient.initialized) this.ttsEdgeClient.setPrimaryLang(lang);
     if (this.ttsKokoroClient.initialized) this.ttsKokoroClient.setPrimaryLang(lang);
+    if (this.ttsVibeVoiceClient.initialized) this.ttsVibeVoiceClient.setPrimaryLang(lang);
     if (this.ttsWebClient.initialized) this.ttsWebClient.setPrimaryLang(lang);
     if (this.ttsNativeClient?.initialized) this.ttsNativeClient?.setPrimaryLang(lang);
   }
@@ -982,10 +993,12 @@ export class TTSController extends EventTarget {
     const ttsWebVoices = await this.ttsWebClient.getVoices(lang);
     const ttsEdgeVoices = await this.ttsEdgeClient.getVoices(lang);
     const ttsKokoroVoices = await this.ttsKokoroClient.getVoices(lang);
+    const ttsVibeVoiceVoices = await this.ttsVibeVoiceClient.getVoices(lang);
     const ttsNativeVoices = (await this.ttsNativeClient?.getVoices(lang)) ?? [];
 
     const voicesGroups = [
       ...ttsNativeVoices,
+      ...ttsVibeVoiceVoices,
       ...ttsKokoroVoices,
       ...ttsEdgeVoices,
       ...ttsWebVoices,
@@ -1005,15 +1018,31 @@ export class TTSController extends EventTarget {
     const useKokoroTTS = !!this.ttsKokoroVoices.find(
       (voice) => (voiceId === '' || voice.id === voiceId) && !voice.disabled,
     );
+    const useVibeVoiceTTS = !!this.ttsVibeVoiceVoices.find(
+      (voice) => (voiceId === '' || voice.id === voiceId) && !voice.disabled,
+    );
     console.log('[TTSController] setVoice search results:', {
       useEdgeTTS,
       useNativeTTS,
       useKokoroTTS,
+      useVibeVoiceTTS,
     });
     if (useEdgeTTS) {
       console.log('[TTSController] setVoice resolved to EdgeTTSClient');
       this.ttsClient = this.ttsEdgeClient;
       await this.ttsClient.setRate(this.ttsRate);
+    } else if (useVibeVoiceTTS) {
+      console.log('[TTSController] setVoice resolved to VibeVoiceTTSClient');
+      if (!this.ttsVibeVoiceClient.initialized) {
+        console.log('[TTSController] VibeVoiceTTSClient not yet initialized, initializing now...');
+        await this.ttsVibeVoiceClient.init();
+      }
+      this.ttsClient = this.ttsVibeVoiceClient;
+      if (this.ttsVibeVoiceClient.initialized) {
+        await this.ttsClient.setRate(this.ttsRate);
+      } else {
+        console.warn('[TTSController] VibeVoiceTTSClient initialization failed!');
+      }
     } else if (useKokoroTTS) {
       console.log('[TTSController] setVoice resolved to KokoroTTSClient');
       if (!this.ttsKokoroClient.initialized) {
@@ -1302,6 +1331,9 @@ export class TTSController extends EventTarget {
     }
     if (this.ttsKokoroClient.initialized) {
       await this.ttsKokoroClient.shutdown();
+    }
+    if (this.ttsVibeVoiceClient.initialized) {
+      await this.ttsVibeVoiceClient.shutdown();
     }
     if (this.ttsNativeClient?.initialized) {
       await this.ttsNativeClient.shutdown();

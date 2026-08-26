@@ -26,6 +26,12 @@ vi.mock('@/services/tts/KokoroTTSClient', () => ({
   }),
 }));
 
+vi.mock('@/services/tts/VibeVoiceTTSClient', () => ({
+  VibeVoiceTTSClient: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
+    Object.assign(this, createMockTTSClient('vibevoice'));
+  }),
+}));
+
 vi.mock('@/services/tts/NativeTTSClient', () => ({
   NativeTTSClient: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
     Object.assign(this, createMockTTSClient('native'));
@@ -254,7 +260,13 @@ describe('TTSController', () => {
       expect(controller.ttsWebClient.init).toHaveBeenCalled();
     });
 
-    test('sets ttsClient to first available client (kokoro)', async () => {
+    test('sets ttsClient to first available client (vibevoice)', async () => {
+      await controller.init();
+      expect(controller.ttsClient.name).toBe('vibevoice');
+    });
+
+    test('falls back to kokoro when vibevoice is not available', async () => {
+      vi.mocked(controller.ttsVibeVoiceClient.init).mockResolvedValue(false);
       await controller.init();
       expect(controller.ttsClient.name).toBe('kokoro-tts');
     });
@@ -272,11 +284,10 @@ describe('TTSController', () => {
       expect(controller.ttsClient.name).toBe('web');
     });
 
-    test('falls back to web client when preferred client not found', async () => {
+    test('falls back to first available client when preferred client not found', async () => {
       vi.mocked(TTSUtils.getPreferredClient).mockReturnValue('nonexistent');
       await controller.init();
-      // first available is Kokoro
-      expect(controller.ttsClient.name).toBe('kokoro-tts');
+      expect(controller.ttsClient.name).toBe('vibevoice');
     });
 
     test('also initializes native client on Android', async () => {
