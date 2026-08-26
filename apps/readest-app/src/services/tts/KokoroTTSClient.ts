@@ -105,7 +105,7 @@ export class KokoroTTSClient implements TTSClient {
 
   constructor(controller?: TTSControllerBridge) {
     this.controller = controller;
-    this.#endpoint = process.env.NEXT_PUBLIC_KOKORO_TTS_ENDPOINT || '/api/tts/kokoro';
+    this.#endpoint = process.env['NEXT_PUBLIC_KOKORO_TTS_ENDPOINT'] || '/api/tts/kokoro';
     this.#voices = KOKORO_VOICES.map((v) => ({
       id: v.id,
       name: v.name,
